@@ -10,7 +10,7 @@ import re
 import os
 from groq import Groq
 
-MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-70b-versatile")
+MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 
 # ════════════════════════════════════════
 #  SYSTEM PROMPT — This IS the knowledge
