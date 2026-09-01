@@ -207,17 +207,6 @@ def chat_response(user_msg, chat_history, api_key):
 
     return response.choices[0].message.content
 
-
-# ── Display chat history ──
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-
-        # Show download buttons after generation messages
-        if msg.get("has_downloads") and st.session_state.brd_bytes:
-            download_section_inline()
-
-
 # ── Download fragment ──
 @st.fragment
 def download_section_inline():
@@ -243,6 +232,18 @@ def download_section_inline():
             use_container_width=True,
             key=f"tdd_dl_{len(st.session_state.messages)}",
         )
+
+# ── Display chat history ──
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+        # Show download buttons after generation messages
+        if msg.get("has_downloads") and st.session_state.brd_bytes:
+            download_section_inline()
+
+
+
 
 
 # ── Chat input ──
