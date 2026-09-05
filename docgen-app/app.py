@@ -19,6 +19,7 @@ from datetime import datetime
 import json
 import os
 import io
+import re
 from groq import Groq
 
 # ── Page Config ──
@@ -272,8 +273,83 @@ def v(field):
     return "TBD"
 
 
+# ────────────────────────────────────────────────
+#  Deterministic keyword pre-router — bypasses the
+#  LLM for obviously-GENERATE messages so classification
+#  is 100% reliable for the common cases.
+# ────────────────────────────────────────────────
+_GEN_VERB_RE = re.compile(
+    r'\b(build|create|generate|make|produce|draft|write|prepare|design)\b',
+    re.IGNORECASE,
+)
+_GIVE_ME_RE = re.compile(r'\b(give|show|send)\s+me\b', re.IGNORECASE)
+_GEN_TARGET_RE = re.compile(
+    r'\b(brd|tdd|doc|docs|document|documents|flow|diagram|diagrams|files?|deliverables?|package)\b',
+    re.IGNORECASE,
+)
+_INTEGRATION_RE = re.compile(r'\bintegration\b', re.IGNORECASE)
+_MOVEMENT_RE = re.compile(
+    r'\b(pull|push|sync|load|move|read|send|transfer|extract|ingest|import|export|feed|route|copy|fetch|retrieve|writes?)\b',
+    re.IGNORECASE,
+)
+_DIRECTIONAL_RE = re.compile(r'\b(to|from|into|onto)\b', re.IGNORECASE)
+_QUESTION_START_RE = re.compile(
+    r'^\s*(what|how|why|when|where|which|who|can|is|are|do|does|should|could|would|will|may)\b',
+    re.IGNORECASE,
+)
+
+
+def deterministic_intent(msg):
+    """
+    Return 'GENERATE' if the message clearly asks for document generation.
+    Return None for ambiguous cases (let the LLM classify).
+
+    Any one of these fires GENERATE:
+      1. Generation verb (build/create/generate/make/...) + target (brd/tdd/doc/flow/diagram/files/...)
+      2. Generation verb + the word "integration"
+      3. Data-movement verb (pull/push/sync/load/...) + directional word (to/from/into)
+      4. "Give me / show me" + target
+
+    Question-word start with no generation verb → None (probably CHAT).
+    """
+    if not msg or not msg.strip():
+        return None
+
+    starts_with_question = bool(_QUESTION_START_RE.match(msg))
+    has_gen_verb = bool(_GEN_VERB_RE.search(msg))
+    has_give_me = bool(_GIVE_ME_RE.search(msg))
+    has_gen_target = bool(_GEN_TARGET_RE.search(msg))
+
+    # Pure question with no generation verb → let LLM handle it
+    if starts_with_question and not has_gen_verb and not has_give_me:
+        return None
+
+    # Rule 1: gen verb + gen target ("build the BRD", "create the flow diagram")
+    if has_gen_verb and has_gen_target:
+        return "GENERATE"
+
+    # Rule 2: gen verb + "integration" ("build an integration that ...")
+    if has_gen_verb and _INTEGRATION_RE.search(msg):
+        return "GENERATE"
+
+    # Rule 3: movement verb + directional preposition ("pull X from Y", "sync A to B")
+    if not starts_with_question and _MOVEMENT_RE.search(msg) and _DIRECTIONAL_RE.search(msg):
+        return "GENERATE"
+
+    # Rule 4: "give/show me" + a document target ("give me the BRD")
+    if has_give_me and has_gen_target:
+        return "GENERATE"
+
+    return None
+
+
 def classify_intent(user_msg, api_key):
-    """Classify user message as GENERATE, CHAT, or DECLINE."""
+    """Classify user message as GENERATE, CHAT, or DECLINE.
+    Deterministic keyword pre-router first; LLM only for ambiguous cases."""
+    fast = deterministic_intent(user_msg)
+    if fast:
+        return fast, "Matched deterministic GENERATE trigger"
+
     client = Groq(api_key=api_key)
     model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 
@@ -293,7 +369,6 @@ def classify_intent(user_msg, api_key):
 
     raw = response.choices[0].message.content.strip()
     try:
-        import re
         raw = re.sub(r'^```json\s*', '', raw)
         raw = re.sub(r'\s*```$', '', raw)
         first = raw.find('{')
@@ -526,7 +601,7 @@ if chat_value:
 st.markdown("---")
 st.markdown(
     "<p style='text-align: center; color: #999; font-size: 12px;'>"
-    "DocAgent v10 — AI-powered integration documentation assistant. "
+    "DocAgent v11 — AI-powered integration documentation assistant. "
     "Type a requirement, attach a .docx / .pdf / .txt / .md, or ask a question. "
     "Generates BRD, TDD, and a Lucidchart-compatible skeleton process flow."
     "</p>",
