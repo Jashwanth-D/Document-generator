@@ -1,249 +1,39 @@
 """
-app.py
-DocAgent — Smart Integration Documentation Assistant
-Chat interface that detects intent:
-  - Generate docs → produces BRD/TDD
-  - Ask about docs → answers the question
-  - Off-topic → politely declines
-
-v6: Supports file attachments in the chat input (txt, md, docx, pdf).
-Attached files are extracted to text and appended to the prompt, so the
-existing parse/validate/generate pipeline is untouched.
+doc_generator.py
+Generates BRD.docx and TDD.docx from canonical JSON using python-docx.
+Template structure is hardcoded — LLM cannot affect formatting.
 """
 
-import streamlit as st
-from llm_parser import parse_requirement
-from doc_generator import generate_brd, generate_tdd
+from docx import Document
+from docx.shared import Inches, Pt, Cm, RGBColor, Emu
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.oxml.ns import qn, nsdecls
+from docx.oxml import parse_xml
 from datetime import datetime
-import json
-import os
 import io
-from groq import Groq
+import re
 
-# ── Page Config ──
-st.set_page_config(
-    page_title="DocAgent",
-    page_icon="📄",
-    layout="centered",
-)
-
-# ── Init session state ──
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "brd_bytes" not in st.session_state:
-    st.session_state.brd_bytes = None
-if "tdd_bytes" not in st.session_state:
-    st.session_state.tdd_bytes = None
-if "safe_name" not in st.session_state:
-    st.session_state.safe_name = "Integration"
-if "show_downloads" not in st.session_state:
-    st.session_state.show_downloads = False
-
-# ── Styling ──
-st.markdown("""
-<style>
-    .main-header { text-align: center; color: #1F3864; margin-bottom: 0; }
-    .sub-header { text-align: center; color: #666; font-size: 14px; margin-top: -10px; margin-bottom: 20px; }
-    .scope-notice { background-color: #f0f4ff; padding: 10px 15px; border-radius: 8px; border-left: 4px solid #1F3864; font-size: 13px; color: #333; margin-bottom: 20px; }
-    .attachment-chip { display: inline-block; background: #eef2ff; color: #1F3864; padding: 2px 8px; border-radius: 12px; font-size: 12px; margin-right: 6px; }
-</style>
-""", unsafe_allow_html=True)
-
-# ── Header ──
-st.markdown("<h1 class='main-header'>📄 DocAgent</h1>", unsafe_allow_html=True)
-st.markdown("<p class='sub-header'>Integration Documentation Assistant</p>", unsafe_allow_html=True)
-st.markdown("""<div class='scope-notice'>
-    💡 I can help you with: <b>generating BRD/TDD documents</b> from requirements,
-    <b>answering questions about integration documentation</b>, and
-    <b>guiding you on how to write your own</b>. Type your requirement or
-    <b>📎 attach a .docx / .pdf / .txt / .md</b> file — I'll read it for you.
-</div>""", unsafe_allow_html=True)
-
-# ── API Key ──
-api_key = None
-try:
-    api_key = st.secrets.get("GROQ_API_KEY", None)
-except:
-    pass
-
-if not api_key:
-    with st.sidebar:
-        st.markdown("### ⚙️ Configuration")
-        api_key = st.text_input("Groq API Key", type="password", help="Get your free key at console.groq.com")
-        st.markdown("---")
-        st.markdown("**How to get a free API key:**")
-        st.markdown("1. Go to [console.groq.com](https://console.groq.com)")
-        st.markdown("2. Sign up (free)")
-        st.markdown("3. Create an API key")
-        st.markdown("4. Paste it above")
-
-with st.sidebar:
-    st.markdown("---")
-    st.markdown("### 📌 Quick Examples")
-    st.markdown("**Generate docs:**")
-    st.markdown("_Create an integration that reads PO files from SFTP and loads into ERP database._")
-    st.markdown("")
-    st.markdown("**Or attach a file:**")
-    st.markdown("_Drop a requirement .docx, PDF, or text file straight into the chat._")
-    st.markdown("")
-    st.markdown("**Ask a question:**")
-    st.markdown("_What sections should a TDD have?_")
-    st.markdown("_How do I classify work types?_")
-    st.markdown("")
-    if st.button("🗑️ Clear Chat", use_container_width=True):
-        st.session_state.messages = []
-        st.session_state.brd_bytes = None
-        st.session_state.tdd_bytes = None
-        st.session_state.show_downloads = False
-        st.rerun()
+# Matches the token "TBD" as a whole word (won't match "TBDMORE" or inside "STANDARD")
+_TBD_RE = re.compile(r'(\bTBD\b)')
 
 
-# ── Intent classifier + chat system prompt ──
-ROUTER_SYSTEM = """You are DocAgent, a friendly AI assistant focused on integration documentation.
-
-Your THREE capabilities:
-1. GENERATE — Generate BRD and TDD documents from an integration requirement
-2. CHAT — Answer questions, have conversations, explain things
-3. DECLINE — Only for clearly irrelevant requests
-
-CLASSIFICATION RULES:
-
-GENERATE when:
-- The user provides an integration requirement (mentions source/target systems, data movement, creating/building an integration)
-- They explicitly ask you to generate or create documents
-- The user attaches a file that contains an integration requirement (source/target systems, data movement, etc.)
-
-CHAT when (this is the DEFAULT — when in doubt, pick CHAT):
-- Greetings, introductions, "hi", "hello"
-- Questions about what you can do, your capabilities, your knowledge, your limits
-- Questions about documentation, templates, BRD, TDD, work types, integration patterns
-- Questions about how to write documentation or best practices
-- Follow-up questions about previously generated documents
-- Anything vaguely related to your purpose or the user trying to understand you
-- General conversation that can be steered toward documentation topics
-
-DECLINE only when:
-- The request is COMPLETELY unrelated to documentation AND cannot be reasonably connected (e.g. "write me a poem about cats", "solve 2+2", "what's the weather", "help me with my Python homework")
-- Even then, be friendly about it
-
-IMPORTANT: Err on the side of CHAT. Only DECLINE things that are truly, obviously irrelevant. If the user asks about YOU, your abilities, your scope — that is CHAT, not DECLINE.
-
-Respond with ONLY a JSON object, nothing else:
-{"intent": "GENERATE" | "CHAT" | "DECLINE", "reasoning": "brief explanation"}
-"""
-
-CHAT_SYSTEM = """You are DocAgent, a friendly and knowledgeable assistant focused on integration documentation.
-
-Your specialty is:
-- Generating BRD (Business Requirements Document) and TDD (Technical Design Document) from integration requirements
-- Explaining BRD and TDD structure and all 32 TDD sections
-- Work type classification (T1: File→DB, T2: API→DB, T3: DB→DB, T4: DB→File, T5: DB→API)
-- Integration patterns (batch, real-time, event-driven)
-- Best practices for writing integration requirements and documentation
-- Anti-hallucination practices (EXPLICIT, DERIVED, STANDARD_DEFAULT, ASSUMPTION, TBD, HUMAN_REQUIRED tags)
-- Boomi middleware documentation standards
-- Acceptance criteria, scope, assumptions, dependencies, mappings, validation rules
-- Testing strategy for integrations
-
-When users ask what you can do, explain your capabilities warmly. When users ask about your knowledge or limits, be honest and helpful about what you cover.
-
-You're friendly and conversational. You can handle greetings, small talk that leads to documentation topics, and meta-questions about yourself. Just gently steer the conversation toward documentation when it drifts too far.
-
-Keep answers concise, practical, and useful. Use examples from integration documentation context when helpful.
-"""
-
-DECLINE_MSG = "I appreciate the question! That one's a bit outside what I'm built for though. My specialty is integration documentation — I can generate BRDs and TDDs, explain work types and template structure, or help you figure out how to document your integrations. Want to try any of that?"
-
-
-# ────────────────────────────────────────────────
-#  File extraction — pulls plain text from
-#  attached txt / md / docx / pdf files.
-# ────────────────────────────────────────────────
-def extract_text_from_file(uploaded_file):
-    """Return plain text extracted from an UploadedFile, or an error string."""
-    name = uploaded_file.name
-    lower = name.lower()
-    try:
-        data = uploaded_file.read()
-    except Exception as e:
-        return f"[Could not read {name}: {e}]"
-
-    try:
-        if lower.endswith((".txt", ".md")):
-            return data.decode("utf-8", errors="replace").strip()
-
-        if lower.endswith(".docx"):
-            from docx import Document
-            doc = Document(io.BytesIO(data))
-            parts = []
-            for p in doc.paragraphs:
-                if p.text.strip():
-                    parts.append(p.text.strip())
-            # Also pull table cell text — requirements often live in tables
-            for table in doc.tables:
-                for row in table.rows:
-                    cells = [c.text.strip() for c in row.cells if c.text.strip()]
-                    if cells:
-                        parts.append(" | ".join(cells))
-            return "\n".join(parts).strip()
-
-        if lower.endswith(".pdf"):
-            from pypdf import PdfReader
-            reader = PdfReader(io.BytesIO(data))
-            pages = []
-            for page in reader.pages:
-                try:
-                    pages.append(page.extract_text() or "")
-                except Exception:
-                    continue
-            return "\n".join(pages).strip()
-
-        return f"[Unsupported file type: {name}]"
-    except Exception as e:
-        return f"[Extraction failed for {name}: {e}]"
-
-
-def build_combined_prompt(user_text, uploaded_files):
-    """
-    Merge typed text and extracted file contents into a single prompt
-    that the parser can consume. Also returns a display-friendly version
-    for the chat history.
-    """
-    user_text = (user_text or "").strip()
-    file_blocks = []
-    display_chips = []
-
-    for f in uploaded_files or []:
-        content = extract_text_from_file(f)
-        display_chips.append(f.name)
-        if content and not content.startswith("["):
-            file_blocks.append(f"--- Attached file: {f.name} ---\n{content}")
-        else:
-            file_blocks.append(f"--- Attached file: {f.name} ---\n{content or '[Empty]'}")
-
-    parts = []
-    if user_text:
-        parts.append(user_text)
-    if file_blocks:
-        parts.append("\n\n".join(file_blocks))
-    combined = "\n\n".join(parts).strip()
-
-    # Display version — keep the user's typed text, list attachments as chips
-    if display_chips:
-        chips_html = " ".join(
-            f"<span class='attachment-chip'>📎 {name}</span>" for name in display_chips
-        )
-        if user_text:
-            display = f"{user_text}\n\n{chips_html}"
-        else:
-            display = chips_html
-    else:
-        display = user_text
-
-    return combined, display
-
-
+# ── Helpers ──
 def v(field):
+    if field is None:
+        return "TBD"
+    if isinstance(field, str):
+        return field
+    if isinstance(field, dict) and "value" in field:
+        val = str(field["value"])
+        if field.get("tag") == "ASSUMPTION" and not val.endswith("[ASSUMPTION]"):
+            return val + " [ASSUMPTION]"
+        return val
+    return "TBD"
+
+
+def v_raw(field):
+    """Get value without ASSUMPTION suffix."""
     if field is None:
         return "TBD"
     if isinstance(field, str):
@@ -253,249 +43,691 @@ def v(field):
     return "TBD"
 
 
-def classify_intent(user_msg, api_key):
-    """Classify user message as GENERATE, CHAT, or DECLINE."""
-    client = Groq(api_key=api_key)
-    model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+HEADER_COLOR = "1F3864"
+HEADER_TEXT = "FFFFFF"
+ALT_ROW = "F2F2F2"
+BORDER_COLOR = "B4C6E7"
+FONT_NAME = "Calibri"
+FONT_SIZE = Pt(10)
 
-    # For very long attachments, only send a preview to the router — it
-    # only needs to decide intent, not read the whole thing.
-    router_input = user_msg if len(user_msg) < 2000 else user_msg[:2000] + "\n[...truncated for intent classification]"
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": ROUTER_SYSTEM},
-            {"role": "user", "content": router_input},
-        ],
-        temperature=0.0,
-        max_tokens=100,
+def set_cell_shading(cell, color):
+    shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{color}"/>')
+    cell._tc.get_or_add_tcPr().append(shading)
+
+
+def _add_runs_with_tbd(paragraph, text, bold=False):
+    """
+    Add text to a paragraph. Any 'TBD' token (whole word) gets bright
+    yellow highlight + bold so reviewers can spot it instantly.
+    Everything else gets the normal font.
+    """
+    text = "" if text is None else str(text)
+    parts = _TBD_RE.split(text)
+    for part in parts:
+        if part == "":
+            continue
+        run = paragraph.add_run(part)
+        run.font.name = FONT_NAME
+        run.font.size = FONT_SIZE
+        if bold:
+            run.bold = True
+        if part == "TBD":
+            run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+            run.bold = True
+    return paragraph
+
+
+def make_header_row(table, texts):
+    row = table.rows[0]
+    for i, text in enumerate(texts):
+        cell = row.cells[i]
+        cell.text = ""
+        p = cell.paragraphs[0]
+        run = p.add_run(text)
+        run.bold = True
+        run.font.size = FONT_SIZE
+        run.font.name = FONT_NAME
+        run.font.color.rgb = RGBColor.from_string(HEADER_TEXT)
+        set_cell_shading(cell, HEADER_COLOR)
+
+
+def add_data_row(table, values, shaded=False):
+    row = table.add_row()
+    for i, val in enumerate(values):
+        cell = row.cells[i]
+        cell.text = ""
+        p = cell.paragraphs[0]
+        _add_runs_with_tbd(p, val)
+        if shaded:
+            set_cell_shading(cell, ALT_ROW)
+    return row
+
+
+def add_label_value_row(table, label, value, shaded=False):
+    row = table.add_row()
+    # Label cell (bold, no TBD expected here)
+    cell0 = row.cells[0]
+    cell0.text = ""
+    run0 = cell0.paragraphs[0].add_run(label)
+    run0.bold = True
+    run0.font.size = FONT_SIZE
+    run0.font.name = FONT_NAME
+    # Value cell — highlight any TBD tokens
+    cell1 = row.cells[1]
+    cell1.text = ""
+    _add_runs_with_tbd(cell1.paragraphs[0], value)
+    if shaded:
+        set_cell_shading(cell0, ALT_ROW)
+        set_cell_shading(cell1, ALT_ROW)
+    return row
+
+
+def two_col_table(doc, rows_data):
+    table = doc.add_table(rows=1, cols=2)
+    table.style = "Table Grid"
+    # Set header for first row
+    cell0 = table.rows[0].cells[0]
+    cell1 = table.rows[0].cells[1]
+    cell0.text = ""
+    cell1.text = ""
+    r0 = cell0.paragraphs[0].add_run(rows_data[0][0])
+    r0.bold = True
+    r0.font.size = FONT_SIZE
+    r0.font.name = FONT_NAME
+    _add_runs_with_tbd(cell1.paragraphs[0], rows_data[0][1])
+
+    for i, (label, value) in enumerate(rows_data[1:], 1):
+        add_label_value_row(table, label, value, shaded=(i % 2 == 0))
+
+    return table
+
+
+def add_heading(doc, text, level=1):
+    h = doc.add_heading(text, level=level)
+    for run in h.runs:
+        run.font.color.rgb = RGBColor.from_string(HEADER_COLOR)
+    return h
+
+
+def add_para(doc, text):
+    p = doc.add_paragraph()
+    _add_runs_with_tbd(p, text)
+    return p
+
+
+def add_bullets(doc, items):
+    for item in items:
+        p = doc.add_paragraph(style="List Bullet")
+        p.clear()
+        _add_runs_with_tbd(p, item)
+
+
+# ════════════════════════════════════════
+#  BRD GENERATOR
+# ════════════════════════════════════════
+def generate_brd(c):
+    doc = Document()
+
+    # Set default font
+    style = doc.styles["Normal"]
+    style.font.name = FONT_NAME
+    style.font.size = FONT_SIZE
+
+    project_name = v(c.get("project", {}).get("name"))
+    opco = v(c.get("project", {}).get("opco"))
+    date_str = v(c.get("project", {}).get("date", {"value": datetime.now().strftime("%b %d, %Y")}))
+    wt_code = v_raw(c.get("integration", {}).get("workTypeCode"))
+
+    # ── Title ──
+    title = doc.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = title.add_run("Business Requirements Document")
+    run.bold = True
+    run.font.size = Pt(18)
+    run.font.color.rgb = RGBColor.from_string(HEADER_COLOR)
+
+    subtitle = doc.add_paragraph()
+    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = subtitle.add_run("Integration Projects")
+    run.font.size = Pt(12)
+    run.font.color.rgb = RGBColor.from_string(HEADER_COLOR)
+
+    info = doc.add_paragraph()
+    info.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _add_runs_with_tbd(info, f"{project_name} | {opco} | {date_str}", bold=True)
+
+    # Version table — labels are always known; values may be TBD
+    vtable = doc.add_table(rows=2, cols=4)
+    vtable.style = "Table Grid"
+    for i, text in enumerate(["Version", v(c["project"].get("version")), "Author", v(c["project"].get("author"))]):
+        cell = vtable.rows[0].cells[i]
+        cell.text = ""
+        is_label = (i % 2 == 0)
+        _add_runs_with_tbd(cell.paragraphs[0], text, bold=is_label)
+    for i, text in enumerate(["Date", date_str, "Reviewer", v(c["project"].get("reviewer"))]):
+        cell = vtable.rows[1].cells[i]
+        cell.text = ""
+        is_label = (i % 2 == 0)
+        _add_runs_with_tbd(cell.paragraphs[0], text, bold=is_label)
+        set_cell_shading(cell, ALT_ROW)
+
+    doc.add_page_break()
+
+    # ── Project Overview ──
+    add_heading(doc, "Project Overview", level=1)
+
+    def wt_check(code):
+        return "☑" if wt_code == code else "☐"
+
+    wt_text = (
+        f"{wt_check('T1')} T1 – File to Database\n"
+        f"{wt_check('T2')} T2 – API to Database\n"
+        f"{wt_check('T3')} T3 – Database to Database\n"
+        f"{wt_check('T4')} T4 – Database to File\n"
+        f"{wt_check('T5')} T5 – Database to API\n"
+        f"Integration Type: {v(c.get('integration', {}).get('direction'))}"
     )
 
-    raw = response.choices[0].message.content.strip()
-    try:
-        import re
-        raw = re.sub(r'^```json\s*', '', raw)
-        raw = re.sub(r'\s*```$', '', raw)
-        first = raw.find('{')
-        last = raw.rfind('}')
-        if first != -1 and last != -1:
-            result = json.loads(raw[first:last + 1])
-            return result.get("intent", "CHAT"), result.get("reasoning", "")
-    except:
-        pass
-    return "CHAT", "Could not classify, defaulting to documentation chat"
-
-
-def chat_response(user_msg, chat_history, api_key):
-    """Generate a documentation-related chat response."""
-    client = Groq(api_key=api_key)
-    model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
-
-    messages = [{"role": "system", "content": CHAT_SYSTEM}]
-    for msg in chat_history[-10:]:
-        if msg["role"] in ("user", "assistant"):
-            messages.append({"role": msg["role"], "content": msg["content"]})
-    messages.append({"role": "user", "content": user_msg})
-
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0.3,
-        max_tokens=1024,
+    classification = v_raw(c.get("project", {}).get("classification"))
+    cls_text = (
+        f"{'☑' if classification == 'New Project' else '☐'} New Project  "
+        f"{'☑' if classification == 'Phase of Existing Project' else '☐'} Phase of Existing Project  "
+        f"{'☑' if classification == 'Enhancement' else '☐'} Enhancement"
     )
 
-    return response.choices[0].message.content
+    entities = ", ".join(v(e) for e in c.get("entities", [{"value": "TBD"}]))
+
+    two_col_table(doc, [
+        ["Project Name", project_name],
+        ["OpCo Name", opco],
+        ["Business Function", v(c.get("project", {}).get("businessFunction"))],
+        ["Business Contacts", v(c.get("project", {}).get("businessContacts"))],
+        ["Brief Description", v(c.get("requirement", {}).get("businessObjective"))],
+        ["Project Classification", cls_text],
+        ["Type of Work", wt_text],
+        ["Source System(s)", v(c.get("source", {}).get("system"))],
+        ["Destination System(s)", v(c.get("target", {}).get("system"))],
+    ])
+
+    doc.add_paragraph()
+
+    # ── Customer Requirement Statement ──
+    add_heading(doc, "Customer Requirement Statement", level=1)
+
+    scope = "\n".join("• " + v(a) for a in c.get("acceptanceCriteria", []))
+    out_of_scope = "\n".join("• " + v(a) for a in c.get("outOfScope", []))
+    acceptance = "\n".join("• " + v(a) for a in c.get("acceptanceCriteria", []))
+
+    two_col_table(doc, [
+        ["Requirement Statement", v(c.get("requirement", {}).get("statement"))],
+        ["Visual Flow Diagrams", "TBD — to be created during detailed design"],
+        ["Data Entities", entities],
+        ["Mapping Document", v(c.get("mappings", {}).get("status"))],
+        ["Integration Platform", v(c.get("integration", {}).get("middleware"))],
+        ["Scope Information", scope or "TBD"],
+        ["Out of Scope", out_of_scope or "TBD"],
+        ["Acceptance Criteria", acceptance or "TBD"],
+        ["Reference Integrations", "N/A — new integration"],
+        ["Detailed Estimate", "TBD — to be estimated after detailed design"],
+    ])
+
+    doc.add_paragraph()
+
+    # ── Unresolved Items ──
+    add_heading(doc, "Unresolved Items / TBDs", level=1)
+    add_para(doc, "The following items require clarification or confirmation before or during detailed design:")
+    add_bullets(doc, c.get("unresolvedItems", ["No unresolved items identified"]))
+
+    doc.add_paragraph()
+
+    # ── Change Log ──
+    add_heading(doc, "Change Log", level=1)
+    add_para(doc, "Track changes or additions to previously stated requirements.")
+
+    cl_table = doc.add_table(rows=1, cols=4)
+    cl_table.style = "Table Grid"
+    make_header_row(cl_table, ["Date", "Changeset ID", "Requestor", "Description of Changes"])
+    add_data_row(cl_table, [date_str, "CS-001", "AI-DocGen", "Initial Version — BRD auto-generated from requirement."])
+
+    doc.add_paragraph()
+    add_para(doc, f"Confidential – {opco}")
+
+    # Save to buffer
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer
 
 
-# ── Download fragment (must be defined BEFORE the chat history loop below) ──
-@st.fragment
-def download_section_inline():
-    if not st.session_state.brd_bytes:
-        return
-    safe_name = st.session_state.safe_name
-    col1, col2 = st.columns(2)
-    with col1:
-        st.download_button(
-            label="📘 Download BRD.docx",
-            data=st.session_state.brd_bytes,
-            file_name=f"BRD_{safe_name}_v1_0.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True,
-            key=f"brd_dl_{len(st.session_state.messages)}",
-        )
-    with col2:
-        st.download_button(
-            label="📗 Download TDD.docx",
-            data=st.session_state.tdd_bytes,
-            file_name=f"TDD_{safe_name}_v1_0.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True,
-            key=f"tdd_dl_{len(st.session_state.messages)}",
-        )
+# ════════════════════════════════════════
+#  TDD GENERATOR
+# ════════════════════════════════════════
+def generate_tdd(c):
+    doc = Document()
 
+    style = doc.styles["Normal"]
+    style.font.name = FONT_NAME
+    style.font.size = FONT_SIZE
 
-# ── Display chat history ──
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        # Use HTML for user messages so attachment chips render
-        if msg["role"] == "user" and msg.get("has_attachments"):
-            st.markdown(msg["content"], unsafe_allow_html=True)
-        else:
-            st.markdown(msg["content"])
+    project_name = v(c.get("project", {}).get("name"))
+    opco = v(c.get("project", {}).get("opco"))
+    date_str = v(c.get("project", {}).get("date", {"value": datetime.now().strftime("%b %d, %Y")}))
+    src = v(c.get("source", {}).get("system"))
+    tgt = v(c.get("target", {}).get("system"))
+    middleware = v(c.get("integration", {}).get("middleware"))
+    pattern = v(c.get("integration", {}).get("pattern"))
+    entities = ", ".join(v(e) for e in c.get("entities", [{"value": "TBD"}]))
+    entities_lower = entities.lower()
+    biz_func = v(c.get("project", {}).get("businessFunction"))
+    protocol = v(c.get("source", {}).get("protocol"))
 
-        if msg.get("has_downloads") and st.session_state.brd_bytes:
-            download_section_inline()
+    # ── Title Page ──
+    title = doc.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = title.add_run("Enterprise Boomi Technical Design Document (TDD)")
+    run.bold = True
+    run.font.size = Pt(16)
+    run.font.color.rgb = RGBColor.from_string(HEADER_COLOR)
 
+    sub = doc.add_paragraph()
+    sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = sub.add_run(project_name)
+    run.bold = True
+    run.font.size = Pt(13)
+    run.font.color.rgb = RGBColor.from_string(HEADER_COLOR)
 
-# ── Chat input with file attachment support ──
-chat_value = st.chat_input(
-    "Describe your integration requirement or attach a file...",
-    accept_file="multiple",
-    file_type=["txt", "md", "docx", "pdf"],
-)
+    # Document info
+    add_heading(doc, "Document Information", level=2)
+    two_col_table(doc, [
+        ["Document Name", "Technical Design Document"],
+        ["Project Name", project_name],
+        ["Integration Name", project_name],
+        ["OPU / OPCO", opco],
+        ["Version", v(c["project"].get("version"))],
+        ["Author", v(c["project"].get("author"))],
+        ["Reviewer", v(c["project"].get("reviewer"))],
+        ["Approver", "TBD"],
+        ["Creation Date", date_str],
+        ["Last Modified Date", date_str],
+    ])
 
-if chat_value:
-    if not api_key:
-        st.error("Please enter your Groq API key in the sidebar.")
-        st.stop()
+    doc.add_paragraph()
+    add_heading(doc, "Revision History", level=2)
+    rh = doc.add_table(rows=1, cols=4)
+    rh.style = "Table Grid"
+    make_header_row(rh, ["Version", "Date", "Author", "Description"])
+    add_data_row(rh, ["1.0", date_str, "AI-DocGen", "Initial TDD auto-generated from requirement."])
 
-    # st.chat_input with accept_file returns a ChatInputValue with .text and .files
-    typed_text = getattr(chat_value, "text", "") or ""
-    files = getattr(chat_value, "files", None) or []
+    doc.add_page_break()
 
-    if not typed_text.strip() and not files:
-        st.stop()
+    # ── Section 1: Introduction ──
+    add_heading(doc, "1. Introduction", level=1)
+    add_heading(doc, "1.1 Purpose", level=2)
+    add_para(doc, f"This document defines the technical design for the integration that processes {entities_lower} data from {src} and loads it into {tgt}. It covers architecture, process flow, mappings, validations, error handling, deployment, monitoring, and support procedures.")
 
-    with st.spinner("Reading attachments..." if files else "Thinking..."):
-        combined_prompt, display_msg = build_combined_prompt(typed_text, files)
+    add_heading(doc, "1.2 Business Background", level=2)
+    add_para(doc, v(c.get("requirement", {}).get("businessObjective")))
 
-    # If attachments produced no text at all AND no typed text, bail early
-    if not combined_prompt.strip():
-        error_msg = "I couldn't read any text from that. Try a different file or type your requirement."
-        st.session_state.messages.append({"role": "user", "content": display_msg, "has_attachments": bool(files)})
-        st.session_state.messages.append({"role": "assistant", "content": error_msg})
-        st.rerun()
+    add_heading(doc, "1.3 Objectives", level=2)
+    add_bullets(doc, [
+        f"Automate the ingestion of {entities_lower} data from {src} into {tgt}.",
+        "Ensure accurate data transformation and validation before loading.",
+        "Minimize manual intervention in the data transfer process.",
+        f"Improve operational efficiency for the {biz_func.lower()} function.",
+    ])
 
-    # Show user message
-    st.session_state.messages.append({
-        "role": "user",
-        "content": display_msg,
-        "has_attachments": bool(files),
-    })
-    with st.chat_message("user"):
-        st.markdown(display_msg, unsafe_allow_html=True)
+    add_heading(doc, "1.4 Success Criteria", level=2)
+    add_bullets(doc, [
+        "Successful processing rate > 99%.",
+        f"SLA compliance achieved (SLA: {v(c.get('integration', {}).get('sla'))}).",
+        "No critical production issues post-deployment.",
+        "Successful monitoring and alerting operational.",
+    ])
 
-    # Classify intent
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            try:
-                intent, reasoning = classify_intent(combined_prompt, api_key)
-            except Exception as e:
-                st.error(f"Error: {str(e)}")
-                st.stop()
+    # ── Section 2: Scope ──
+    add_heading(doc, "2. Scope", level=1)
+    add_heading(doc, "2.1 In Scope", level=2)
+    add_bullets(doc, [
+        f"Retrieval of {entities_lower} data from {src} via {protocol}.",
+        "Data parsing, validation, and transformation.",
+        f"Loading of validated data into {tgt}.",
+        "Error handling, logging, and notification.",
+        "Monitoring and batch status tracking.",
+    ])
+    add_heading(doc, "2.2 Out of Scope", level=2)
+    add_bullets(doc, [v(a) for a in c.get("outOfScope", [{"value": "TBD"}])])
 
-        # ── GENERATE: produce BRD + TDD ──
-        if intent == "GENERATE":
-            with st.status("Generating documents...", expanded=True) as status:
-                st.write("🤖 Analyzing your requirement...")
-                if files:
-                    st.write(f"📎 Using content from {len(files)} attachment(s).")
+    # ── Section 3: Assumptions ──
+    add_heading(doc, "3. Assumptions", level=1)
+    a_table = doc.add_table(rows=1, cols=2)
+    a_table.style = "Table Grid"
+    make_header_row(a_table, ["ID", "Assumption"])
+    for i, a in enumerate(c.get("assumptions", [])):
+        add_data_row(a_table, [f"A{i+1}", v(a)], shaded=(i % 2 == 1))
 
-                try:
-                    result = parse_requirement(combined_prompt, api_key)
-                except Exception as e:
-                    error_msg = f"Sorry, I had trouble parsing that requirement: {str(e)}\n\nCould you rephrase it? Make sure to mention the source system, target system, and what data is being moved."
-                    st.markdown(error_msg)
-                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
-                    st.stop()
+    # ── Section 4: Dependencies ──
+    add_heading(doc, "4. Dependencies", level=1)
+    d_table = doc.add_table(rows=1, cols=3)
+    d_table.style = "Table Grid"
+    make_header_row(d_table, ["ID", "Dependency", "Owner"])
+    for i, d in enumerate(c.get("dependencies", [])):
+        add_data_row(d_table, [f"D{i+1}", v(d), "TBD"], shaded=(i % 2 == 1))
 
-                canonical = result["canonical"]
-                validation = result["validation"]
-                cross = result["crossValidation"]
+    # ── Section 5: Risks ──
+    add_heading(doc, "5. Risks and Mitigation", level=1)
+    r_table = doc.add_table(rows=1, cols=3)
+    r_table.style = "Table Grid"
+    make_header_row(r_table, ["Risk", "Impact", "Mitigation"])
+    risks = [
+        ("Source system unavailable or connectivity failure", "High", "Retry mechanism with alerting; confirm connectivity during setup."),
+        ("Invalid or malformed data content", "Medium", "Validation rules applied before loading; rejected records logged."),
+        ("Target system connectivity failure", "High", "Retry mechanism; alerting and escalation."),
+        ("Authentication credential expiry", "Medium", "Credential rotation procedures; monitoring for auth failures."),
+        ("Data format changes without notification", "Medium", "Schema validation at ingestion; monitoring on parse failures."),
+    ]
+    for i, (risk, impact, mitigation) in enumerate(risks):
+        add_data_row(r_table, [risk, impact, mitigation], shaded=(i % 2 == 1))
 
-                st.write("📋 Generating BRD and TDD...")
+    # ── Section 6: Solution Overview ──
+    add_heading(doc, "6. Solution Overview", level=1)
+    add_heading(doc, "6.1 Functional Overview", level=2)
+    add_para(doc, f"The integration connects to {src}, retrieves {entities_lower} data, validates and transforms the data per the mapping specification, and loads validated records into {tgt}. Batch status (Completed or Error) is recorded for every run.")
+    add_heading(doc, "6.2 Integration Pattern", level=2)
+    add_para(doc, pattern)
+    add_heading(doc, "6.3 High-Level Architecture", level=2)
+    add_para(doc, f"{src} → {middleware} Integration Layer → {tgt}")
 
-                try:
-                    brd_buffer = generate_brd(canonical)
-                    tdd_buffer = generate_tdd(canonical)
-                except Exception as e:
-                    error_msg = f"Document generation failed: {str(e)}"
-                    st.markdown(error_msg)
-                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
-                    st.stop()
+    # ── Section 7: Technical Summary ──
+    add_heading(doc, "7. Technical Summary", level=1)
+    two_col_table(doc, [
+        ["Source System", src],
+        ["Target System", tgt],
+        ["Middleware", middleware],
+        ["Trigger Type", v(c.get("integration", {}).get("trigger"))],
+        ["Schedule", v(c.get("integration", {}).get("schedule"))],
+        ["Protocol", protocol],
+        ["Authentication", v(c.get("security", {}).get("sourceAuth"))],
+        ["Data Volume", v(c.get("source", {}).get("volume"))],
+        ["SLA", v(c.get("integration", {}).get("sla"))],
+    ])
 
-                project_name = v(canonical.get("project", {}).get("name", "Integration"))
-                safe_name = "".join(c if c.isalnum() or c in "_ " else "_" for c in project_name)[:50]
+    # ── Section 8: Source System ──
+    add_heading(doc, "8. Source System Details", level=1)
+    two_col_table(doc, [
+        ["System Name", src],
+        ["Interface Type", f"{v(c['source'].get('interfaceType'))} ({protocol})"],
+        ["Authentication Method", v(c.get("security", {}).get("sourceAuth"))],
+        ["Data Format", v(c["source"].get("dataFormat"))],
+        ["Volume", v(c["source"].get("volume"))],
+        ["Frequency", v(c["source"].get("frequency"))],
+    ])
 
-                st.session_state.brd_bytes = brd_buffer.getvalue()
-                st.session_state.tdd_bytes = tdd_buffer.getvalue()
-                st.session_state.safe_name = safe_name
+    # ── Section 9: Target System ──
+    add_heading(doc, "9. Target System Details", level=1)
+    two_col_table(doc, [
+        ["System Name", tgt],
+        ["Interface Type", v(c["target"].get("interfaceType"))],
+        ["Authentication Method", v(c.get("security", {}).get("targetAuth"))],
+        ["Data Format", v(c["target"].get("dataFormat"))],
+        ["Target Table", v(c["target"].get("targetTable"))],
+        ["Volume", v(c["target"].get("volume"))],
+    ])
 
-                status.update(label="✅ Documents ready!", state="complete", expanded=True)
+    # ── Section 10: End-to-End Flow ──
+    add_heading(doc, "10. End-to-End Process Flow", level=1)
+    schedule = v(c.get("integration", {}).get("schedule"))
+    trigger_text = f"on a {schedule.lower()} schedule" if schedule != "TBD" else "per the configured trigger (TBD)"
 
-            entities = ", ".join(v(e) for e in canonical.get("entities", []))
-            summary = f"""**Documents generated successfully!** Here's what I extracted:
+    steps = [
+        ("Step 1: Trigger", f"The integration is initiated {trigger_text}."),
+        ("Step 2: Authentication", f"The process authenticates to {src} using configured credentials (method: {v(c.get('security', {}).get('sourceAuth'))})."),
+        ("Step 3: Data Extraction", f"{entities} data is retrieved from {src} and staged for processing."),
+        ("Step 4: Validation", "Data is validated against business and technical rules before transformation. Invalid records are rejected and logged."),
+        ("Step 5: Transformation", f"Validated records are transformed per the mapping specification ({v(c.get('mappings', {}).get('status'))})."),
+        ("Step 6: Processing", "Transformed records are processed in batch and routed to the target system."),
+        ("Step 7: Target Update", f"Records are inserted/updated in {tgt} (target table: {v(c['target'].get('targetTable'))})."),
+        ("Step 8: Notification", "Success and failure notifications are sent per the notification strategy (Section 21). Batch status is recorded as Completed (C) or Error (E)."),
+    ]
+    for heading, text in steps:
+        add_heading(doc, heading, level=2)
+        add_para(doc, text)
 
-| Field | Value |
-|-------|-------|
-| **Source** | {v(canonical.get('source', {}).get('system'))} |
-| **Target** | {v(canonical.get('target', {}).get('system'))} |
-| **Work Type** | {v(canonical.get('integration', {}).get('workType'))} |
-| **Direction** | {v(canonical.get('integration', {}).get('direction'))} |
-| **Pattern** | {v(canonical.get('integration', {}).get('pattern'))} |
-| **Entities** | {entities} |
+    # ── Section 11: Detailed Process Design ──
+    add_heading(doc, "11. Detailed Process Design", level=1)
+    add_heading(doc, "11.1 Main Integration Process", level=2)
+    add_para(doc, f"Purpose: Connect to {src}, retrieve {entities_lower} data, validate, transform, and load into {tgt}.")
 
-"""
-            if cross["status"] == "PASS":
-                summary += "✅ **Cross-validation passed** — BRD and TDD are consistent.\n\n"
-            else:
-                summary += "⚠️ **Review required:**\n"
-                for issue in cross["issues"]:
-                    summary += f"- {issue}\n"
-                summary += "\n"
+    add_heading(doc, "Processing Logic", level=3)
+    add_bullets(doc, [
+        f"Connect to {src} using configured credentials.",
+        f"Retrieve {entities_lower} data.",
+        "Validate each record against validation rules (Section 14).",
+        "Transform valid records per mapping specification (Section 12).",
+        f"Insert/update records in {tgt}.",
+        "Log rejected records with error details.",
+    ])
 
-            tbds = canonical.get("unresolvedItems", [])
-            if tbds:
-                summary += "**Key TBDs to resolve:**\n"
-                for item in tbds[:6]:
-                    summary += f"- {item}\n"
-                summary += "\n"
+    add_heading(doc, "Success Scenario", level=3)
+    add_para(doc, f"All valid records are loaded into {tgt}; batch status set to Completed.")
+    add_heading(doc, "Failure Scenario", level=3)
+    add_para(doc, "Write failure or transformation error is logged; batch status set to Error.")
 
-            summary += "Download your documents below 👇"
+    # ── Section 12: Data Mapping ──
+    add_heading(doc, "12. Data Mapping Specification", level=1)
+    add_para(doc, "Field-level mapping is TBD — no mapping specification was provided. The table below will be populated during detailed design.")
+    m_table = doc.add_table(rows=1, cols=6)
+    m_table.style = "Table Grid"
+    make_header_row(m_table, ["Source Field", "Source Type", "Target Field", "Target Type", "Transformation", "Mandatory"])
+    add_data_row(m_table, ["TBD", "TBD", "TBD", "TBD", "TBD", "TBD"])
 
-            st.markdown(summary)
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": summary,
-                "has_downloads": True,
-            })
+    # ── Section 13: Business Rules ──
+    add_heading(doc, "13. Business Rules", level=1)
+    br_table = doc.add_table(rows=1, cols=2)
+    br_table.style = "Table Grid"
+    make_header_row(br_table, ["Rule ID", "Description"])
+    for i, r in enumerate(c.get("businessRules", [{"value": "TBD"}])):
+        add_data_row(br_table, [f"BR-{i+1:03d}", v(r)], shaded=(i % 2 == 1))
 
-            download_section_inline()
+    # ── Section 14: Validation Rules ──
+    add_heading(doc, "14. Validation Rules", level=1)
+    add_para(doc, "Specific validation rules are TBD pending mapping specification. Standard types:")
+    vr_table = doc.add_table(rows=1, cols=3)
+    vr_table.style = "Table Grid"
+    make_header_row(vr_table, ["Validation Type", "Rule", "Action"])
+    for i, (vtype, rule, action) in enumerate([
+        ("Mandatory", "TBD — required fields per mapping", "Reject"),
+        ("Format", "TBD — data type and format checks", "Reject"),
+        ("Duplicate", "TBD — duplicate record detection", "Skip"),
+        ("Business", "TBD — business-specific rules", "Error"),
+    ]):
+        add_data_row(vr_table, [vtype, rule, action], shaded=(i % 2 == 1))
 
-        # ── CHAT: answer documentation question ──
-        elif intent == "CHAT":
-            with st.spinner(""):
-                try:
-                    response = chat_response(combined_prompt, st.session_state.messages, api_key)
-                except Exception as e:
-                    response = f"Sorry, I encountered an error: {str(e)}"
+    # ── Section 15: Connectivity ──
+    add_heading(doc, "15. Connectivity Specifications", level=1)
+    add_heading(doc, "15.1 Source Connectivity", level=2)
+    two_col_table(doc, [
+        ["System", src],
+        ["Protocol", protocol],
+        ["Authentication", v(c.get("security", {}).get("sourceAuth"))],
+    ])
+    doc.add_paragraph()
+    add_heading(doc, "15.2 Target Connectivity", level=2)
+    two_col_table(doc, [
+        ["System", tgt],
+        ["Connection Type", "TBD"],
+        ["Authentication", v(c.get("security", {}).get("targetAuth"))],
+        ["Target Table/Schema", v(c["target"].get("targetTable"))],
+    ])
 
-            st.markdown(response)
-            st.session_state.messages.append({"role": "assistant", "content": response})
+    # ── Section 16: Components ──
+    add_heading(doc, "16. Integration Components", level=1)
+    add_heading(doc, "Boomi Components", level=2)
+    add_para(doc, "Component names will be assigned during build.")
+    bc_table = doc.add_table(rows=1, cols=3)
+    bc_table.style = "Table Grid"
+    make_header_row(bc_table, ["Component Type", "Name", "Purpose"])
+    for i, (ctype, purpose) in enumerate([
+        ("Process", "Main integration process"),
+        ("Connector", f"Source connector for {src}"),
+        ("Connector", f"Target connector for {tgt}"),
+        ("Map", "Data field mapping"),
+        ("Profile", "Source data profile"),
+    ]):
+        add_data_row(bc_table, [ctype, "TBD", purpose], shaded=(i % 2 == 1))
 
-        # ── DECLINE: out of scope ──
-        elif intent == "DECLINE":
-            st.markdown(DECLINE_MSG)
-            st.session_state.messages.append({"role": "assistant", "content": DECLINE_MSG})
+    doc.add_paragraph()
+    add_heading(doc, "Reusable Components", level=2)
+    two_col_table(doc, [
+        ["Logging Framework", "Standard Boomi logging [STANDARD_DEFAULT]"],
+        ["Error Handler", "Standard Boomi error handling [STANDARD_DEFAULT]"],
+        ["Notification Service", "TBD"],
+    ])
 
+    # ── Section 17: Configuration ──
+    add_heading(doc, "17. Configuration Management", level=1)
+    add_para(doc, f"Environment-specific properties ({src} credentials, {tgt} connection strings) will be managed via Boomi environment extensions. Details TBD during build.")
 
-# ── Footer ──
-st.markdown("---")
-st.markdown(
-    "<p style='text-align: center; color: #999; font-size: 12px;'>"
-    "DocAgent v6 — AI-powered integration documentation assistant. "
-    "Type a requirement, attach a .docx / .pdf / .txt / .md, or ask a question."
-    "</p>",
-    unsafe_allow_html=True,
-)
+    # ── Section 18: Error Handling ──
+    add_heading(doc, "18. Error Handling Strategy", level=1)
+    add_heading(doc, "Technical Errors", level=2)
+    add_bullets(doc, ["Source connectivity or authentication failure", "Target connectivity failure", "Data read/parse failure", "System unavailability"])
+    add_heading(doc, "Functional Errors", level=2)
+    add_bullets(doc, ["Business rule violation", "Invalid or missing mandatory data", "Data format mismatch"])
+    add_heading(doc, "Error Response Matrix", level=2)
+    er_table = doc.add_table(rows=1, cols=4)
+    er_table.style = "Table Grid"
+    make_header_row(er_table, ["Error Type", "Retry", "Notification", "Action"])
+    for i, row in enumerate([
+        ("Technical", "Yes", "Yes", "Retry per Section 19"),
+        ("Functional", "No", "Yes", "Reject record"),
+        ("Validation", "No", "Yes", "Archive for review"),
+    ]):
+        add_data_row(er_table, row, shaded=(i % 2 == 1))
+
+    # ── Section 19: Retry ──
+    add_heading(doc, "19. Retry Strategy", level=1)
+    rt_table = doc.add_table(rows=1, cols=3)
+    rt_table.style = "Table Grid"
+    make_header_row(rt_table, ["Error Condition", "Retry Count", "Interval"])
+    for i, row in enumerate([
+        ("Source connection timeout", "3", "5 minutes"),
+        ("Target connection failure", "3", "5 minutes"),
+        ("System unavailability", "5", "Exponential backoff"),
+    ]):
+        add_data_row(rt_table, row, shaded=(i % 2 == 1))
+
+    # ── Section 20: Logging ──
+    add_heading(doc, "20. Logging and Monitoring", level=1)
+    add_heading(doc, "Logging Requirements", level=2)
+    add_bullets(doc, ["Process Name", "Execution ID", "Start / End Time", "Records processed / loaded / failed", "Error details for failed records"])
+    add_heading(doc, "Monitoring Requirements", level=2)
+    add_bullets(doc, ["Success Rate", "Failure Rate", "Throughput", "Average Execution Time"])
+
+    # ── Section 21: Notifications ──
+    add_heading(doc, "21. Notification Strategy", level=1)
+    add_heading(doc, "Success", level=2)
+    add_para(doc, "Recipients: TBD\nBatch completed successfully. Records loaded: <count>.")
+    add_heading(doc, "Failure", level=2)
+    add_para(doc, "Recipients: TBD\nBatch failed. Error: <summary>.")
+
+    # ── Section 22: Security ──
+    add_heading(doc, "22. Security Design", level=1)
+    add_bullets(doc, [
+        f"Source authentication: {v(c.get('security', {}).get('sourceAuth'))}",
+        f"Target authentication: {v(c.get('security', {}).get('targetAuth'))}",
+        f"{v(c.get('security', {}).get('encryption'))} [STANDARD_DEFAULT]",
+        "Secure credential storage via Boomi connection configuration [STANDARD_DEFAULT]",
+    ])
+
+    # ── Section 23: Retention ──
+    add_heading(doc, "23. Archive and Retention", level=1)
+    two_col_table(doc, [
+        ["Success Records", "TBD"],
+        ["Error Records", "TBD"],
+        ["Logs", "TBD"],
+    ])
+
+    # ── Section 24: Performance ──
+    add_heading(doc, "24. Performance Considerations", level=1)
+    add_para(doc, f"Expected volume: {v(c.get('source', {}).get('volume'))}. Batch size and performance tuning TBD during build.")
+
+    # ── Section 25: Testing ──
+    add_heading(doc, "25. Testing Strategy", level=1)
+    add_heading(doc, "Unit Testing", level=2)
+    add_para(doc, f"Validate {src} connectivity, data parsing, transformation logic, and {tgt} write operations in isolation.")
+    add_heading(doc, "SIT", level=2)
+    add_para(doc, f"End-to-end validation with sample data against non-production {src} and {tgt}.")
+    add_heading(doc, "UAT", level=2)
+    add_para(doc, f"Business validation that loaded records match expected {entities_lower} data.")
+
+    # ── Section 26: Deployment ──
+    add_heading(doc, "26. Deployment Strategy", level=1)
+    add_heading(doc, "Pre-Deployment Checklist", level=2)
+    add_bullets(doc, ["Code review completed", "Unit testing completed", "Source connectivity validated", "Target connectivity validated", "Configuration validated", "Documentation updated"])
+    add_heading(doc, "Deployment Steps", level=2)
+    add_bullets(doc, ["Package deployment to target Boomi environment", "Environment configuration", "Smoke testing", "Validation of loaded data"])
+    add_heading(doc, "Rollback Plan", level=2)
+    add_para(doc, "Revert to prior process version; validate during build.")
+
+    # ── Section 27: Support ──
+    add_heading(doc, "27. Support Runbook", level=1)
+    add_heading(doc, "L1 Support", level=2)
+    add_bullets(doc, ["Monitor batch execution status", "Review alerts", "Escalate unresolved errors"])
+    add_heading(doc, "L2 Support", level=2)
+    add_bullets(doc, ["Root cause analysis", "Reprocessing failed batches", "Configuration review"])
+    add_heading(doc, "L3 Support", level=2)
+    add_bullets(doc, ["Code fixes", "Enhancement support", "Vendor coordination"])
+
+    # ── Section 28: Operations ──
+    add_heading(doc, "28. Operational Procedures", level=1)
+    add_bullets(doc, ["Daily: Process status check, failed execution review", "Weekly: Performance review, error trend analysis", "Monthly: SLA compliance, capacity analysis"])
+
+    # ── Section 29: Escalation ──
+    add_heading(doc, "29. Escalation Matrix", level=1)
+    esc = doc.add_table(rows=1, cols=3)
+    esc.style = "Table Grid"
+    make_header_row(esc, ["Severity", "Team", "Response Time"])
+    for i, row in enumerate([
+        ("Critical", "Integration Team", "1 Hour"),
+        ("High", "Integration Team", "4 Hours"),
+        ("Medium", "Support Team", "1 Business Day"),
+        ("Low", "Support Team", "3 Business Days"),
+    ]):
+        add_data_row(esc, row, shaded=(i % 2 == 1))
+
+    # ── Section 30: Future ──
+    add_heading(doc, "30. Future Enhancements", level=1)
+    add_bullets(doc, [
+        "Define and implement field-level mapping once specifications are confirmed.",
+        "Implement email/Slack notifications for success and failure.",
+        "Add data reconciliation reporting.",
+    ])
+
+    # ── Section 31: References ──
+    add_heading(doc, "31. References", level=1)
+    add_bullets(doc, [f"BRD — {project_name}", "Mapping Specification (TBD)", "Source System Documentation (TBD)", "Target System Documentation (TBD)"])
+
+    # ── Section 32: Appendix ──
+    add_heading(doc, "32. Appendix", level=1)
+    add_heading(doc, "Acronyms", level=2)
+    acr = doc.add_table(rows=1, cols=2)
+    acr.style = "Table Grid"
+    make_header_row(acr, ["Acronym", "Description"])
+    for i, (a, d) in enumerate([
+        ("TDD", "Technical Design Document"), ("BRD", "Business Requirements Document"),
+        ("API", "Application Programming Interface"), ("SFTP", "Secure File Transfer Protocol"),
+        ("SLA", "Service Level Agreement"), ("ERP", "Enterprise Resource Planning"),
+        ("OPCO", "Operating Company"),
+    ]):
+        add_data_row(acr, [a, d], shaded=(i % 2 == 1))
+
+    doc.add_paragraph()
+    add_heading(doc, "Unresolved Items", level=2)
+    add_bullets(doc, c.get("unresolvedItems", ["None"]))
+
+    # Save to buffer
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer
