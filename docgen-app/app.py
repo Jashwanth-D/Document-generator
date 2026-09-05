@@ -103,37 +103,52 @@ with st.sidebar:
 
 
 # ── Intent classifier + chat system prompt ──
-ROUTER_SYSTEM = """You are DocAgent, a friendly AI assistant focused on integration documentation.
+ROUTER_SYSTEM = """You are the intent classifier for DocAgent. Classify each user message into exactly one of: GENERATE, CHAT, DECLINE.
 
-Your THREE capabilities:
-1. GENERATE — Generate BRD and TDD documents from an integration requirement
-2. CHAT — Answer questions, have conversations, explain things
-3. DECLINE — Only for clearly irrelevant requests
+═══ GENERATE ═══
+The user wants BRD / TDD / flow documents actually produced. Pick GENERATE when ANY of the following is true:
 
-CLASSIFICATION RULES:
+(a) The message describes data moving between systems — mentions a source AND a target, OR clearly describes moving/syncing/loading/pulling/pushing/reading/writing data.
+   Examples that MUST be GENERATE:
+   • "Build an integration that reads PO files from SFTP and loads into ERP"
+   • "Sync customer accounts from Salesforce to Oracle nightly"
+   • "Pull employee data from Workday into JDE"
+   • "Push work-order completions from JDE to ServiceNow"
+   • "Move invoices from the billing DB to an SFTP server for auditors"
+   • "Create an integration that calls the Salesforce REST API to retrieve new customer accounts and inserts them into the Oracle ERP customer master database"
 
-GENERATE when:
-- The user provides an integration requirement (mentions source/target systems, data movement, creating/building an integration)
-- They explicitly ask you to generate or create documents
-- The user attaches a file that contains an integration requirement (source/target systems, data movement, etc.)
+(b) The message explicitly asks to build / create / generate / make / produce / draft documents, BRD, TDD, docs, flow, or diagram.
+   Examples that MUST be GENERATE:
+   • "Generate the BRD and TDD"
+   • "Build me the docs"
+   • "Create the flow diagram"
+   • "Make the technical design document"
+   • "BUILD BRD and TDD and flow diagram"
+   • "build me the tdd brd and flow diagram"
 
-CHAT when (this is the DEFAULT — when in doubt, pick CHAT):
-- Greetings, introductions, "hi", "hello"
-- Questions about what you can do, your capabilities, your knowledge, your limits
-- Questions about documentation, templates, BRD, TDD, work types, integration patterns
-- Questions about how to write documentation or best practices
-- Follow-up questions about previously generated documents
-- Anything vaguely related to your purpose or the user trying to understand you
-- General conversation that can be steered toward documentation topics
+(c) The message includes an attached file whose content describes an integration requirement.
 
-DECLINE only when:
-- The request is COMPLETELY unrelated to documentation AND cannot be reasonably connected (e.g. "write me a poem about cats", "solve 2+2", "what's the weather", "help me with my Python homework")
-- Even then, be friendly about it
+If ANY of (a), (b), or (c) applies → GENERATE. Do not second-guess. Do not route to CHAT just because the message is polite, long, or contains extra context.
 
-IMPORTANT: Err on the side of CHAT. Only DECLINE things that are truly, obviously irrelevant. If the user asks about YOU, your abilities, your scope — that is CHAT, not DECLINE.
+═══ CHAT ═══
+Pick CHAT ONLY when the message is a pure question, greeting, or conceptual discussion with NO integration requirement described AND NO explicit generation request.
+   Examples that are CHAT:
+   • "Hi" / "Hello" / "How does this work?"
+   • "What can you do?"
+   • "What's the difference between T1 and T2?"
+   • "How should I structure a TDD?"
+   • "What are the 32 sections of a TDD?"
+   • "Explain the work-type classification"
+   • "Can I attach a Word doc?"
 
-Respond with ONLY a JSON object, nothing else:
-{"intent": "GENERATE" | "CHAT" | "DECLINE", "reasoning": "brief explanation"}
+═══ DECLINE ═══
+Pick DECLINE ONLY when the message is completely unrelated to integration documentation (poems, weather, unrelated coding help, personal advice, math homework).
+
+═══ TIE-BREAKER ═══
+If a message could plausibly be either GENERATE or CHAT → pick GENERATE. It is far better to produce documents the user can refine than to keep chatting when they wanted output.
+
+Respond with ONLY this JSON, nothing else:
+{"intent": "GENERATE" | "CHAT" | "DECLINE", "reasoning": "one short sentence"}
 """
 
 CHAT_SYSTEM = """You are DocAgent, a friendly and knowledgeable assistant focused on integration documentation.
@@ -511,7 +526,7 @@ if chat_value:
 st.markdown("---")
 st.markdown(
     "<p style='text-align: center; color: #999; font-size: 12px;'>"
-    "DocAgent v9 — AI-powered integration documentation assistant. "
+    "DocAgent v10 — AI-powered integration documentation assistant. "
     "Type a requirement, attach a .docx / .pdf / .txt / .md, or ask a question. "
     "Generates BRD, TDD, and a Lucidchart-compatible skeleton process flow."
     "</p>",
