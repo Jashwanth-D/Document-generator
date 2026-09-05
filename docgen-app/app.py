@@ -5,6 +5,10 @@ Chat interface that detects intent:
   - Generate docs → produces BRD/TDD
   - Ask about docs → answers the question
   - Off-topic → politely declines
+
+v6: Supports file attachments in the chat input (txt, md, docx, pdf).
+Attached files are extracted to text and appended to the prompt, so the
+existing parse/validate/generate pipeline is untouched.
 """
 
 import streamlit as st
@@ -13,6 +17,7 @@ from doc_generator import generate_brd, generate_tdd
 from datetime import datetime
 import json
 import os
+import io
 from groq import Groq
 
 # ── Page Config ──
@@ -40,6 +45,7 @@ st.markdown("""
     .main-header { text-align: center; color: #1F3864; margin-bottom: 0; }
     .sub-header { text-align: center; color: #666; font-size: 14px; margin-top: -10px; margin-bottom: 20px; }
     .scope-notice { background-color: #f0f4ff; padding: 10px 15px; border-radius: 8px; border-left: 4px solid #1F3864; font-size: 13px; color: #333; margin-bottom: 20px; }
+    .attachment-chip { display: inline-block; background: #eef2ff; color: #1F3864; padding: 2px 8px; border-radius: 12px; font-size: 12px; margin-right: 6px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -47,9 +53,10 @@ st.markdown("""
 st.markdown("<h1 class='main-header'>📄 DocAgent</h1>", unsafe_allow_html=True)
 st.markdown("<p class='sub-header'>Integration Documentation Assistant</p>", unsafe_allow_html=True)
 st.markdown("""<div class='scope-notice'>
-    💡 I can help you with: <b>generating BRD/TDD documents</b> from requirements, 
-    <b>answering questions about integration documentation</b>, and 
-    <b>guiding you on how to write your own</b>. Just ask naturally.
+    💡 I can help you with: <b>generating BRD/TDD documents</b> from requirements,
+    <b>answering questions about integration documentation</b>, and
+    <b>guiding you on how to write your own</b>. Type your requirement or
+    <b>📎 attach a .docx / .pdf / .txt / .md</b> file — I'll read it for you.
 </div>""", unsafe_allow_html=True)
 
 # ── API Key ──
@@ -76,6 +83,9 @@ with st.sidebar:
     st.markdown("**Generate docs:**")
     st.markdown("_Create an integration that reads PO files from SFTP and loads into ERP database._")
     st.markdown("")
+    st.markdown("**Or attach a file:**")
+    st.markdown("_Drop a requirement .docx, PDF, or text file straight into the chat._")
+    st.markdown("")
     st.markdown("**Ask a question:**")
     st.markdown("_What sections should a TDD have?_")
     st.markdown("_How do I classify work types?_")
@@ -101,6 +111,7 @@ CLASSIFICATION RULES:
 GENERATE when:
 - The user provides an integration requirement (mentions source/target systems, data movement, creating/building an integration)
 - They explicitly ask you to generate or create documents
+- The user attaches a file that contains an integration requirement (source/target systems, data movement, etc.)
 
 CHAT when (this is the DEFAULT — when in doubt, pick CHAT):
 - Greetings, introductions, "hi", "hello"
@@ -144,6 +155,94 @@ Keep answers concise, practical, and useful. Use examples from integration docum
 DECLINE_MSG = "I appreciate the question! That one's a bit outside what I'm built for though. My specialty is integration documentation — I can generate BRDs and TDDs, explain work types and template structure, or help you figure out how to document your integrations. Want to try any of that?"
 
 
+# ────────────────────────────────────────────────
+#  File extraction — pulls plain text from
+#  attached txt / md / docx / pdf files.
+# ────────────────────────────────────────────────
+def extract_text_from_file(uploaded_file):
+    """Return plain text extracted from an UploadedFile, or an error string."""
+    name = uploaded_file.name
+    lower = name.lower()
+    try:
+        data = uploaded_file.read()
+    except Exception as e:
+        return f"[Could not read {name}: {e}]"
+
+    try:
+        if lower.endswith((".txt", ".md")):
+            return data.decode("utf-8", errors="replace").strip()
+
+        if lower.endswith(".docx"):
+            from docx import Document
+            doc = Document(io.BytesIO(data))
+            parts = []
+            for p in doc.paragraphs:
+                if p.text.strip():
+                    parts.append(p.text.strip())
+            # Also pull table cell text — requirements often live in tables
+            for table in doc.tables:
+                for row in table.rows:
+                    cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                    if cells:
+                        parts.append(" | ".join(cells))
+            return "\n".join(parts).strip()
+
+        if lower.endswith(".pdf"):
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(data))
+            pages = []
+            for page in reader.pages:
+                try:
+                    pages.append(page.extract_text() or "")
+                except Exception:
+                    continue
+            return "\n".join(pages).strip()
+
+        return f"[Unsupported file type: {name}]"
+    except Exception as e:
+        return f"[Extraction failed for {name}: {e}]"
+
+
+def build_combined_prompt(user_text, uploaded_files):
+    """
+    Merge typed text and extracted file contents into a single prompt
+    that the parser can consume. Also returns a display-friendly version
+    for the chat history.
+    """
+    user_text = (user_text or "").strip()
+    file_blocks = []
+    display_chips = []
+
+    for f in uploaded_files or []:
+        content = extract_text_from_file(f)
+        display_chips.append(f.name)
+        if content and not content.startswith("["):
+            file_blocks.append(f"--- Attached file: {f.name} ---\n{content}")
+        else:
+            file_blocks.append(f"--- Attached file: {f.name} ---\n{content or '[Empty]'}")
+
+    parts = []
+    if user_text:
+        parts.append(user_text)
+    if file_blocks:
+        parts.append("\n\n".join(file_blocks))
+    combined = "\n\n".join(parts).strip()
+
+    # Display version — keep the user's typed text, list attachments as chips
+    if display_chips:
+        chips_html = " ".join(
+            f"<span class='attachment-chip'>📎 {name}</span>" for name in display_chips
+        )
+        if user_text:
+            display = f"{user_text}\n\n{chips_html}"
+        else:
+            display = chips_html
+    else:
+        display = user_text
+
+    return combined, display
+
+
 def v(field):
     if field is None:
         return "TBD"
@@ -159,18 +258,21 @@ def classify_intent(user_msg, api_key):
     client = Groq(api_key=api_key)
     model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 
+    # For very long attachments, only send a preview to the router — it
+    # only needs to decide intent, not read the whole thing.
+    router_input = user_msg if len(user_msg) < 2000 else user_msg[:2000] + "\n[...truncated for intent classification]"
+
     response = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": ROUTER_SYSTEM},
-            {"role": "user", "content": user_msg},
+            {"role": "user", "content": router_input},
         ],
         temperature=0.0,
         max_tokens=100,
     )
 
     raw = response.choices[0].message.content.strip()
-    # Parse intent JSON
     try:
         import re
         raw = re.sub(r'^```json\s*', '', raw)
@@ -178,11 +280,10 @@ def classify_intent(user_msg, api_key):
         first = raw.find('{')
         last = raw.rfind('}')
         if first != -1 and last != -1:
-            result = json.loads(raw[first:last+1])
+            result = json.loads(raw[first:last + 1])
             return result.get("intent", "CHAT"), result.get("reasoning", "")
     except:
         pass
-    # Fallback: if can't parse, default to CHAT
     return "CHAT", "Could not classify, defaulting to documentation chat"
 
 
@@ -192,7 +293,6 @@ def chat_response(user_msg, chat_history, api_key):
     model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 
     messages = [{"role": "system", "content": CHAT_SYSTEM}]
-    # Include last 10 messages for context
     for msg in chat_history[-10:]:
         if msg["role"] in ("user", "assistant"):
             messages.append({"role": msg["role"], "content": msg["content"]})
@@ -207,7 +307,8 @@ def chat_response(user_msg, chat_history, api_key):
 
     return response.choices[0].message.content
 
-# ── Download fragment ──
+
+# ── Download fragment (must be defined BEFORE the chat history loop below) ──
 @st.fragment
 def download_section_inline():
     if not st.session_state.brd_bytes:
@@ -233,35 +334,63 @@ def download_section_inline():
             key=f"tdd_dl_{len(st.session_state.messages)}",
         )
 
+
 # ── Display chat history ──
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+        # Use HTML for user messages so attachment chips render
+        if msg["role"] == "user" and msg.get("has_attachments"):
+            st.markdown(msg["content"], unsafe_allow_html=True)
+        else:
+            st.markdown(msg["content"])
 
-        # Show download buttons after generation messages
         if msg.get("has_downloads") and st.session_state.brd_bytes:
             download_section_inline()
 
 
+# ── Chat input with file attachment support ──
+chat_value = st.chat_input(
+    "Describe your integration requirement or attach a file...",
+    accept_file="multiple",
+    file_type=["txt", "md", "docx", "pdf"],
+)
 
-
-
-# ── Chat input ──
-if prompt := st.chat_input("Describe your integration requirement or ask a documentation question..."):
+if chat_value:
     if not api_key:
         st.error("Please enter your Groq API key in the sidebar.")
         st.stop()
 
+    # st.chat_input with accept_file returns a ChatInputValue with .text and .files
+    typed_text = getattr(chat_value, "text", "") or ""
+    files = getattr(chat_value, "files", None) or []
+
+    if not typed_text.strip() and not files:
+        st.stop()
+
+    with st.spinner("Reading attachments..." if files else "Thinking..."):
+        combined_prompt, display_msg = build_combined_prompt(typed_text, files)
+
+    # If attachments produced no text at all AND no typed text, bail early
+    if not combined_prompt.strip():
+        error_msg = "I couldn't read any text from that. Try a different file or type your requirement."
+        st.session_state.messages.append({"role": "user", "content": display_msg, "has_attachments": bool(files)})
+        st.session_state.messages.append({"role": "assistant", "content": error_msg})
+        st.rerun()
+
     # Show user message
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    st.session_state.messages.append({
+        "role": "user",
+        "content": display_msg,
+        "has_attachments": bool(files),
+    })
     with st.chat_message("user"):
-        st.markdown(prompt)
+        st.markdown(display_msg, unsafe_allow_html=True)
 
     # Classify intent
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
-                intent, reasoning = classify_intent(prompt, api_key)
+                intent, reasoning = classify_intent(combined_prompt, api_key)
             except Exception as e:
                 st.error(f"Error: {str(e)}")
                 st.stop()
@@ -270,9 +399,11 @@ if prompt := st.chat_input("Describe your integration requirement or ask a docum
         if intent == "GENERATE":
             with st.status("Generating documents...", expanded=True) as status:
                 st.write("🤖 Analyzing your requirement...")
+                if files:
+                    st.write(f"📎 Using content from {len(files)} attachment(s).")
 
                 try:
-                    result = parse_requirement(prompt, api_key)
+                    result = parse_requirement(combined_prompt, api_key)
                 except Exception as e:
                     error_msg = f"Sorry, I had trouble parsing that requirement: {str(e)}\n\nCould you rephrase it? Make sure to mention the source system, target system, and what data is being moved."
                     st.markdown(error_msg)
@@ -303,7 +434,6 @@ if prompt := st.chat_input("Describe your integration requirement or ask a docum
 
                 status.update(label="✅ Documents ready!", state="complete", expanded=True)
 
-            # Build summary
             entities = ", ".join(v(e) for e in canonical.get("entities", []))
             summary = f"""**Documents generated successfully!** Here's what I extracted:
 
@@ -341,14 +471,13 @@ if prompt := st.chat_input("Describe your integration requirement or ask a docum
                 "has_downloads": True,
             })
 
-            # Show downloads
             download_section_inline()
 
         # ── CHAT: answer documentation question ──
         elif intent == "CHAT":
             with st.spinner(""):
                 try:
-                    response = chat_response(prompt, st.session_state.messages, api_key)
+                    response = chat_response(combined_prompt, st.session_state.messages, api_key)
                 except Exception as e:
                     response = f"Sorry, I encountered an error: {str(e)}"
 
@@ -365,8 +494,8 @@ if prompt := st.chat_input("Describe your integration requirement or ask a docum
 st.markdown("---")
 st.markdown(
     "<p style='text-align: center; color: #999; font-size: 12px;'>"
-    "DocAgent v2.0 — AI-powered integration documentation assistant. "
-    "I can generate BRDs/TDDs, answer documentation questions, and guide you on best practices."
+    "DocAgent v6 — AI-powered integration documentation assistant. "
+    "Type a requirement, attach a .docx / .pdf / .txt / .md, or ask a question."
     "</p>",
     unsafe_allow_html=True,
 )
