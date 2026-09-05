@@ -6,12 +6,16 @@ Template structure is hardcoded — LLM cannot affect formatting.
 
 from docx import Document
 from docx.shared import Inches, Pt, Cm, RGBColor, Emu
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn, nsdecls
 from docx.oxml import parse_xml
 from datetime import datetime
 import io
+import re
+
+# Matches "TBD" as a whole word, case-insensitive (catches TBD, tbd, Tbd, etc.)
+_TBD_RE = re.compile(r'(\bTBD\b)', re.IGNORECASE)
 
 
 # ── Helpers ──
@@ -52,6 +56,28 @@ def set_cell_shading(cell, color):
     cell._tc.get_or_add_tcPr().append(shading)
 
 
+def _add_runs_with_tbd(paragraph, text, bold=False):
+    """
+    Add text to a paragraph. Any 'TBD' token (whole word) gets bright
+    yellow highlight + bold so reviewers can spot it instantly.
+    Everything else gets the normal font.
+    """
+    text = "" if text is None else str(text)
+    parts = _TBD_RE.split(text)
+    for part in parts:
+        if part == "":
+            continue
+        run = paragraph.add_run(part)
+        run.font.name = FONT_NAME
+        run.font.size = FONT_SIZE
+        if bold:
+            run.bold = True
+        if part.upper() == "TBD":
+            run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+            run.bold = True
+    return paragraph
+
+
 def make_header_row(table, texts):
     row = table.rows[0]
     for i, text in enumerate(texts):
@@ -72,9 +98,7 @@ def add_data_row(table, values, shaded=False):
         cell = row.cells[i]
         cell.text = ""
         p = cell.paragraphs[0]
-        run = p.add_run(str(val))
-        run.font.size = FONT_SIZE
-        run.font.name = FONT_NAME
+        _add_runs_with_tbd(p, val)
         if shaded:
             set_cell_shading(cell, ALT_ROW)
     return row
@@ -82,19 +106,17 @@ def add_data_row(table, values, shaded=False):
 
 def add_label_value_row(table, label, value, shaded=False):
     row = table.add_row()
-    # Label cell
+    # Label cell (bold, no TBD expected here)
     cell0 = row.cells[0]
     cell0.text = ""
     run0 = cell0.paragraphs[0].add_run(label)
     run0.bold = True
     run0.font.size = FONT_SIZE
     run0.font.name = FONT_NAME
-    # Value cell
+    # Value cell — highlight any TBD tokens
     cell1 = row.cells[1]
     cell1.text = ""
-    run1 = cell1.paragraphs[0].add_run(str(value))
-    run1.font.size = FONT_SIZE
-    run1.font.name = FONT_NAME
+    _add_runs_with_tbd(cell1.paragraphs[0], value)
     if shaded:
         set_cell_shading(cell0, ALT_ROW)
         set_cell_shading(cell1, ALT_ROW)
@@ -113,9 +135,7 @@ def two_col_table(doc, rows_data):
     r0.bold = True
     r0.font.size = FONT_SIZE
     r0.font.name = FONT_NAME
-    r1 = cell1.paragraphs[0].add_run(str(rows_data[0][1]))
-    r1.font.size = FONT_SIZE
-    r1.font.name = FONT_NAME
+    _add_runs_with_tbd(cell1.paragraphs[0], rows_data[0][1])
 
     for i, (label, value) in enumerate(rows_data[1:], 1):
         add_label_value_row(table, label, value, shaded=(i % 2 == 0))
@@ -132,9 +152,7 @@ def add_heading(doc, text, level=1):
 
 def add_para(doc, text):
     p = doc.add_paragraph()
-    run = p.add_run(text)
-    run.font.size = FONT_SIZE
-    run.font.name = FONT_NAME
+    _add_runs_with_tbd(p, text)
     return p
 
 
@@ -142,9 +160,7 @@ def add_bullets(doc, items):
     for item in items:
         p = doc.add_paragraph(style="List Bullet")
         p.clear()
-        run = p.add_run(str(item))
-        run.font.size = FONT_SIZE
-        run.font.name = FONT_NAME
+        _add_runs_with_tbd(p, item)
 
 
 # ════════════════════════════════════════
@@ -179,29 +195,21 @@ def generate_brd(c):
 
     info = doc.add_paragraph()
     info.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = info.add_run(f"{project_name} | {opco} | {date_str}")
-    run.bold = True
-    run.font.size = FONT_SIZE
+    _add_runs_with_tbd(info, f"{project_name} | {opco} | {date_str}", bold=True)
 
-    # Version table
+    # Version table — labels are always known; values may be TBD
     vtable = doc.add_table(rows=2, cols=4)
     vtable.style = "Table Grid"
     for i, text in enumerate(["Version", v(c["project"].get("version")), "Author", v(c["project"].get("author"))]):
         cell = vtable.rows[0].cells[i]
         cell.text = ""
-        run = cell.paragraphs[0].add_run(text)
-        run.font.size = FONT_SIZE
-        run.font.name = FONT_NAME
-        if i % 2 == 0:
-            run.bold = True
+        is_label = (i % 2 == 0)
+        _add_runs_with_tbd(cell.paragraphs[0], text, bold=is_label)
     for i, text in enumerate(["Date", date_str, "Reviewer", v(c["project"].get("reviewer"))]):
         cell = vtable.rows[1].cells[i]
         cell.text = ""
-        run = cell.paragraphs[0].add_run(text)
-        run.font.size = FONT_SIZE
-        run.font.name = FONT_NAME
-        if i % 2 == 0:
-            run.bold = True
+        is_label = (i % 2 == 0)
+        _add_runs_with_tbd(cell.paragraphs[0], text, bold=is_label)
         set_cell_shading(cell, ALT_ROW)
 
     doc.add_page_break()
