@@ -15,6 +15,7 @@ import streamlit as st
 from llm_parser import parse_requirement
 from doc_generator import generate_brd, generate_tdd
 from flow_generator import generate_flow_drawio
+from test_case_generator import generate_test_cases_xlsx
 from datetime import datetime
 import json
 import os
@@ -38,6 +39,8 @@ if "tdd_bytes" not in st.session_state:
     st.session_state.tdd_bytes = None
 if "flow_drawio" not in st.session_state:
     st.session_state.flow_drawio = None
+if "test_cases_bytes" not in st.session_state:
+    st.session_state.test_cases_bytes = None
 if "safe_name" not in st.session_state:
     st.session_state.safe_name = "Integration"
 if "show_downloads" not in st.session_state:
@@ -99,6 +102,7 @@ with st.sidebar:
         st.session_state.brd_bytes = None
         st.session_state.tdd_bytes = None
         st.session_state.flow_drawio = None
+        st.session_state.test_cases_bytes = None
         st.session_state.show_downloads = False
         st.rerun()
 
@@ -408,7 +412,9 @@ def download_section_inline():
     if not st.session_state.brd_bytes:
         return
     safe_name = st.session_state.safe_name
-    col1, col2, col3 = st.columns(3)
+
+    # Row 1: BRD + TDD
+    col1, col2 = st.columns(2)
     with col1:
         st.download_button(
             label="📘 Download BRD.docx",
@@ -427,6 +433,9 @@ def download_section_inline():
             use_container_width=True,
             key=f"tdd_dl_{len(st.session_state.messages)}",
         )
+
+    # Row 2: Flow + Test Cases
+    col3, col4 = st.columns(2)
     with col3:
         if st.session_state.flow_drawio:
             st.download_button(
@@ -437,6 +446,17 @@ def download_section_inline():
                 use_container_width=True,
                 key=f"flow_dl_{len(st.session_state.messages)}",
                 help="Skeleton process flow. Import into Lucidchart (Direct file import) or open in draw.io / diagrams.net.",
+            )
+    with col4:
+        if st.session_state.test_cases_bytes:
+            st.download_button(
+                label="📙 Download TestCases.xlsx",
+                data=st.session_state.test_cases_bytes,
+                file_name=f"TestCases_{safe_name}_v1_0.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"tc_dl_{len(st.session_state.messages)}",
+                help="Ready-to-use test case workbook. Positive/negative/boundary cases with TBDs highlighted.",
             )
 
 
@@ -525,6 +545,7 @@ if chat_value:
                     brd_buffer = generate_brd(canonical)
                     tdd_buffer = generate_tdd(canonical)
                     flow_drawio = generate_flow_drawio(canonical)
+                    test_cases_buffer = generate_test_cases_xlsx(canonical)
                 except Exception as e:
                     error_msg = f"Document generation failed: {str(e)}"
                     st.markdown(error_msg)
@@ -537,6 +558,7 @@ if chat_value:
                 st.session_state.brd_bytes = brd_buffer.getvalue()
                 st.session_state.tdd_bytes = tdd_buffer.getvalue()
                 st.session_state.flow_drawio = flow_drawio
+                st.session_state.test_cases_bytes = test_cases_buffer.getvalue()
                 st.session_state.safe_name = safe_name
 
                 status.update(label="✅ Documents ready!", state="complete", expanded=True)
@@ -569,7 +591,7 @@ if chat_value:
                     summary += f"- {item}\n"
                 summary += "\n"
 
-            summary += "Download your documents below 👇 (BRD, TDD, and a skeleton process flow importable into [Lucidchart](https://lucid.app) or [draw.io](https://app.diagrams.net))"
+            summary += "Download your deliverables below 👇 (BRD, TDD, skeleton process flow for Lucidchart/draw.io, and a test-case workbook)"
 
             st.markdown(summary)
             st.session_state.messages.append({
@@ -601,10 +623,9 @@ if chat_value:
 st.markdown("---")
 st.markdown(
     "<p style='text-align: center; color: #999; font-size: 12px;'>"
-    "DocAgent v12 — AI-powered integration documentation assistant. "
+    "DocAgent v13 — AI-powered integration documentation assistant. "
     "Type a requirement, attach a .docx / .pdf / .txt / .md, or ask a question. "
-    "Generates BRD, TDD, and a Lucidchart-compatible skeleton process flow. "
-    "TBDs highlighted in yellow across all three."
+    "Generates BRD, TDD, process flow diagram, and a test-case workbook — TBDs highlighted throughout."
     "</p>",
     unsafe_allow_html=True,
 )
