@@ -45,6 +45,10 @@ if "safe_name" not in st.session_state:
     st.session_state.safe_name = "Integration"
 if "show_downloads" not in st.session_state:
     st.session_state.show_downloads = False
+if "last_requirement_prompt" not in st.session_state:
+    st.session_state.last_requirement_prompt = None
+if "awaiting_requirement_details" not in st.session_state:
+    st.session_state.awaiting_requirement_details = False
 
 # ── Styling ──
 st.markdown("""
@@ -104,6 +108,8 @@ with st.sidebar:
         st.session_state.flow_drawio = None
         st.session_state.test_cases_bytes = None
         st.session_state.show_downloads = False
+        st.session_state.last_requirement_prompt = None
+        st.session_state.awaiting_requirement_details = False
         st.rerun()
 
 
@@ -174,6 +180,27 @@ When users ask what you can do, explain your capabilities warmly. When users ask
 You're friendly and conversational. You can handle greetings, small talk that leads to documentation topics, and meta-questions about yourself. Just gently steer the conversation toward documentation when it drifts too far.
 
 Keep answers concise, practical, and useful. Use examples from integration documentation context when helpful.
+
+═══ HARD RULE — YOU ARE NOT THE DOCUMENT GENERATOR ═══
+You are the CHAT fallback only. The real BRD/TDD/flow-diagram/test-case files are produced by a
+separate, deterministic Python pipeline that validates every field against the user's actual
+requirement text. YOU DO NOT HAVE ACCESS TO THAT PIPELINE IN THIS MODE.
+
+Therefore you must NEVER, under any circumstances in a CHAT response:
+- Write out a BRD or TDD section-by-section (no "1. Executive Summary", no numbered FR-001 style
+  requirement tables, no stakeholder tables, no acceptance-criteria tables)
+- Invent stakeholder names, emails, project names, table names, or field mappings
+- Produce a markdown file block and tell the user to "copy this and save it" — this app delivers
+  real .docx/.xlsx/.drawio files via download buttons, never copy-paste text
+- Present fabricated content as if it were the generated output
+
+If it looks like the user wants actual generated documents (they're describing a requirement,
+asking you to "build"/"create"/"give"/"show"/"download" something, or supplying missing details
+like source/target systems), do NOT attempt to produce that content yourself. Instead say
+something like: "Let me generate that properly so it goes through validation — could you
+restate that as a single requirement, e.g. 'Build an integration that reads X from Y and loads
+it into Z'?" Keep it brief and friendly. This ensures they get real, validated files instead of
+invented text.
 """
 
 DECLINE_MSG = "I appreciate the question! That one's a bit outside what I'm built for though. My specialty is integration documentation — I can generate BRDs and TDDs, explain work types and template structure, or help you figure out how to document your integrations. Want to try any of that?"
@@ -286,7 +313,7 @@ _GEN_VERB_RE = re.compile(
     r'\b(build|create|generate|make|produce|draft|write|prepare|design)\b',
     re.IGNORECASE,
 )
-_GIVE_ME_RE = re.compile(r'\b(give|show|send)\s+me\b', re.IGNORECASE)
+_GIVE_ME_RE = re.compile(r'\b(give|show|send|download)\b', re.IGNORECASE)
 _GEN_TARGET_RE = re.compile(
     r'\b(brd|tdd|doc|docs|document|documents|flow|diagram|diagrams|files?|deliverables?|package)\b',
     re.IGNORECASE,
@@ -495,6 +522,42 @@ if chat_value:
     with st.spinner("Reading attachments..." if files else "Thinking..."):
         combined_prompt, display_msg = build_combined_prompt(typed_text, files)
 
+    # ── Follow-up merge: if we're mid-requirement (awaiting missing
+    # details) and this message looks like a short clarification rather
+    # than a fresh topic, merge it into the original requirement and
+    # treat the whole thing as GENERATE. This is what makes messages like
+    # "source is the api and target is the database" or "give the file"
+    # actually regenerate instead of falling into ungrounded chat. ──
+    effective_prompt = combined_prompt
+    force_generate = False
+
+    fast_check = deterministic_intent(combined_prompt)
+    is_give_me_only = (
+        bool(_GIVE_ME_RE.search(combined_prompt))
+        and bool(_GEN_TARGET_RE.search(combined_prompt))
+        and len(combined_prompt.split()) < 15
+    )
+    looks_like_question = bool(_QUESTION_START_RE.match(combined_prompt))
+    is_short_followup = len(combined_prompt.split()) < 30 and not looks_like_question
+
+    if st.session_state.awaiting_requirement_details and st.session_state.last_requirement_prompt:
+        if fast_check == "GENERATE" and is_give_me_only:
+            # "give/show/send/download the file(s)" — re-run the last
+            # requirement rather than trying to parse this tiny message.
+            effective_prompt = (
+                st.session_state.last_requirement_prompt
+                + "\n\n(User confirmed — regenerate the documents.)"
+            )
+            force_generate = True
+        elif fast_check is None and is_short_followup and not files:
+            # Looks like a clarification/answer, not a new topic.
+            effective_prompt = (
+                st.session_state.last_requirement_prompt
+                + "\n\nAdditional details provided by the user:\n"
+                + combined_prompt
+            )
+            force_generate = True
+
     # If attachments produced no text at all AND no typed text, bail early
     if not combined_prompt.strip():
         error_msg = "I couldn't read any text from that. Try a different file or type your requirement."
@@ -514,11 +577,14 @@ if chat_value:
     # Classify intent
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            try:
-                intent, reasoning = classify_intent(combined_prompt, api_key)
-            except Exception as e:
-                st.error(f"Error: {str(e)}")
-                st.stop()
+            if force_generate:
+                intent, reasoning = "GENERATE", "Merged with in-progress requirement"
+            else:
+                try:
+                    intent, reasoning = classify_intent(combined_prompt, api_key)
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+                    st.stop()
 
         # ── GENERATE: produce BRD + TDD ──
         if intent == "GENERATE":
@@ -528,7 +594,7 @@ if chat_value:
                     st.write(f"📎 Using content from {len(files)} attachment(s).")
 
                 try:
-                    result = parse_requirement(combined_prompt, api_key)
+                    result = parse_requirement(effective_prompt, api_key)
                 except Exception as e:
                     error_msg = f"Sorry, I had trouble parsing that requirement: {str(e)}\n\nCould you rephrase it? Make sure to mention the source system, target system, and what data is being moved."
                     st.markdown(error_msg)
@@ -561,6 +627,14 @@ if chat_value:
                 st.session_state.test_cases_bytes = test_cases_buffer.getvalue()
                 st.session_state.safe_name = safe_name
 
+                # Remember this requirement so a short follow-up ("source is X",
+                # "give me the file") can merge into it instead of derailing
+                # into ungrounded chat.
+                st.session_state.last_requirement_prompt = effective_prompt
+                st.session_state.awaiting_requirement_details = bool(
+                    canonical.get("unresolvedItems")
+                ) or cross.get("status") != "PASS"
+
                 status.update(label="✅ Documents ready!", state="complete", expanded=True)
 
             entities = ", ".join(v(e) for e in canonical.get("entities", []))
@@ -589,7 +663,7 @@ if chat_value:
                 summary += "**Key TBDs to resolve:**\n"
                 for item in tbds[:6]:
                     summary += f"- {item}\n"
-                summary += "\n"
+                summary += "\n_Tip: just reply with the missing details (e.g. \"source is Salesforce, target is Oracle\") and I'll regenerate with them filled in._\n\n"
 
             summary += "Download your deliverables below 👇 (BRD, TDD, skeleton process flow for Lucidchart/draw.io, and a test-case workbook)"
 
@@ -623,10 +697,10 @@ if chat_value:
 st.markdown("---")
 st.markdown(
     "<p style='text-align: center; color: #999; font-size: 12px;'>"
-    "DocAgent v14 — AI-powered integration documentation assistant. "
+    "DocAgent v15 — AI-powered integration documentation assistant. "
     "Type a requirement, attach a .docx / .pdf / .txt / .md, or ask a question. "
     "Generates BRD, TDD, process flow, and test-case workbook. "
-    "Aligned to Boomi / Talend SOPs. TBDs highlighted yellow across all files."
+    "Understands short follow-ups to an in-progress requirement."
     "</p>",
     unsafe_allow_html=True,
 )
