@@ -14,6 +14,15 @@ Produces ~18-22 test cases covering:
 TBD content is highlighted in bright yellow so reviewers can spot
 cases that need input from the requirement to be completable.
 Matches the BRD/TDD/Flow diagram highlighting convention.
+
+Workbook layout follows the standard test-case template:
+  1. Summary      — project / process / folder block, product-version
+                    sign-off grid (Version, Iteration, Date, Dev, Data QA,
+                    Boomi QA, Code Review, QA Review, Bug Tracking) and
+                    "Product Requirements by". Same cell positions (C4:N14),
+                    merges, fills and borders as the template.
+  2. Test Cases   — generated test cases.
+  3. Screenshots  — empty tab for testers to paste evidence into.
 """
 
 from openpyxl import Workbook
@@ -35,6 +44,16 @@ TITLE_FONT  = Font(name='Calibri', size=16, bold=True, color='1F3864')
 META_FONT   = Font(name='Calibri', size=10, italic=True, color='666666')
 CELL_FONT   = Font(name='Calibri', size=10)
 TBD_FONT    = Font(name='Calibri', size=10, bold=True)
+
+# ── Summary-sheet styling (copied from Test_Case_standard_template.xlsx) ──
+SUM_LABEL_FILL = PatternFill(start_color='99CCFF', end_color='99CCFF', fill_type='solid')
+SUM_LABEL_FONT = Font(name='Calibri', size=11, bold=True, color='000000')
+SUM_VALUE_FONT = Font(name='Calibri', size=11, color='000000')
+SUM_TBD_FONT   = Font(name='Calibri', size=11, bold=True, color='000000')
+SUM_BORDER     = Border(
+    left=Side(style='thin'), right=Side(style='thin'),
+    top=Side(style='thin'), bottom=Side(style='thin'),
+)
 CENTER      = Alignment(horizontal='center', vertical='center', wrap_text=True)
 THIN_BORDER = Border(
     left=Side(style='thin', color='CCCCCC'),
@@ -442,6 +461,120 @@ def _build_test_cases(canonical):
     return cases
 
 
+# ════════════════════════════════════════════════════════════════
+#  Summary sheet — mirrors the standard template cell-for-cell
+#  (block C4:N14). Human sign-off cells (Dev, QA, reviewers) are
+#  left blank; fields the requirement can't supply show TBD.
+# ════════════════════════════════════════════════════════════════
+SUMMARY_VERSION_HEADERS = [
+    "Version", "Iteration", "Date", "Dev", "Data QA",
+    "Boomi QA", "Code Review", "QA Review", "Bug Tracking",
+]
+# (version, iteration) rows pre-seeded like the template
+SUMMARY_VERSION_ROWS = [("1.0", 1), ("1.0.1", 2), ("1.0.2", 3), ("1.0.3", 4)]
+
+
+def _style_block(ws, min_row, min_col, max_row, max_col, fill=None, font=None,
+                 align=None):
+    """Apply border (and optional fill/font/alignment) to every cell in a range,
+    so merged ranges render with a full outline."""
+    for r in range(min_row, max_row + 1):
+        for c in range(min_col, max_col + 1):
+            cell = ws.cell(row=r, column=c)
+            cell.border = SUM_BORDER
+            if fill is not None:
+                cell.fill = fill
+            if font is not None:
+                cell.font = font
+            if align is not None:
+                cell.alignment = align
+
+
+def _summary_value(ws, row, text):
+    """Write a label/value row: label merged C:E, value merged F:N."""
+    ws.merge_cells(start_row=row, start_column=6, end_row=row, end_column=14)
+    is_tbd = _has_tbd(text)
+    _style_block(
+        ws, row, 6, row, 14,
+        fill=TBD_FILL if is_tbd else None,
+        font=SUM_TBD_FONT if is_tbd else SUM_VALUE_FONT,
+        align=Alignment(horizontal='left', vertical='center', wrap_text=True),
+    )
+    ws.cell(row=row, column=6, value=text)
+
+
+def _summary_label(ws, row, text, end_row=None):
+    end_row = end_row or row
+    ws.merge_cells(start_row=row, start_column=3, end_row=end_row, end_column=5)
+    _style_block(
+        ws, row, 3, end_row, 5,
+        fill=SUM_LABEL_FILL, font=SUM_LABEL_FONT,
+        align=Alignment(horizontal='left', vertical='center', wrap_text=True),
+    )
+    ws.cell(row=row, column=3, value=text)
+
+
+def _build_summary_sheet(ws, canonical):
+    project_name = _v(canonical.get("project", {}).get("name"), "TBD")
+    req_by = _v(canonical.get("project", {}).get("businessContacts"), "")
+    if req_by.strip().upper() in ("TBD", "HUMAN_REQUIRED"):
+        req_by = ""
+
+    # Row 4-5: "Content" title, merged C4:N5
+    ws.merge_cells("C4:N5")
+    _style_block(ws, 4, 3, 5, 14, fill=SUM_LABEL_FILL, font=SUM_LABEL_FONT,
+                 align=Alignment(horizontal='center', vertical='center'))
+    ws["C4"] = "Content"
+
+    # Rows 6-8: Project / Process / Folder
+    _summary_label(ws, 6, "Project Name")
+    _summary_value(ws, 6, project_name)
+    _summary_label(ws, 7, "Process Name")
+    _summary_value(ws, 7, "TBD")
+    _summary_label(ws, 8, "Folder Name")
+    _summary_value(ws, 8, "TBD")
+
+    # Rows 9-13: Product Version label (C9:E13) + version grid (F9:N13)
+    _summary_label(ws, 9, "Product Version", end_row=13)
+    for i, h in enumerate(SUMMARY_VERSION_HEADERS):
+        c = ws.cell(row=9, column=6 + i, value=h)
+        c.fill = SUM_LABEL_FILL
+        c.font = SUM_LABEL_FONT
+        c.border = SUM_BORDER
+        c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    ws.row_dimensions[9].height = 29
+
+    today = datetime.now()
+    for r_off, (ver, it) in enumerate(SUMMARY_VERSION_ROWS):
+        r = 10 + r_off
+        for col in range(6, 15):
+            cell = ws.cell(row=r, column=col)
+            cell.border = SUM_BORDER
+            cell.font = SUM_VALUE_FONT
+            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        ws.cell(row=r, column=6, value=ver)
+        ws.cell(row=r, column=7, value=it)
+        if r_off == 0:
+            d = ws.cell(row=r, column=8, value=today.replace(hour=0, minute=0, second=0, microsecond=0))
+            d.number_format = 'dd-mmm-yyyy'
+
+    # Row 14: Product Requirements by
+    _summary_label(ws, 14, "Product Requirements by")
+    _summary_value(ws, 14, req_by)
+
+    # Column widths: A-B gutter, C-E label, F-N grid
+    for col, w in {"A": 3, "B": 3, "C": 10, "D": 10, "E": 10}.items():
+        ws.column_dimensions[col].width = w
+    for col_idx, w in zip(range(6, 15), [10, 10, 13, 14, 14, 14, 14, 14, 14]):
+        ws.column_dimensions[get_column_letter(col_idx)].width = w
+
+    # Print on one landscape page
+    ws.page_setup.orientation = 'landscape'
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+
 def generate_test_cases_xlsx(canonical):
     """Return a BytesIO of a formatted test-cases workbook (.xlsx)."""
     project_name = _v(canonical.get("project", {}).get("name"), "Integration")
@@ -452,8 +585,14 @@ def generate_test_cases_xlsx(canonical):
     cases = _build_test_cases(canonical)
 
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Test Cases"
+
+    # Tab 1 — Summary (template layout)
+    summary_ws = wb.active
+    summary_ws.title = "Summary"
+    _build_summary_sheet(summary_ws, canonical)
+
+    # Tab 2 — Test Cases
+    ws = wb.create_sheet("Test Cases")
 
     # Row 1 — title (merged across all columns)
     title_cell = ws.cell(row=1, column=1, value=f"Test Cases — {project_name}")
@@ -507,6 +646,12 @@ def generate_test_cases_xlsx(canonical):
 
     # Freeze the header row so it stays visible when scrolling
     ws.freeze_panes = f'A{HEADER_ROW + 1}'
+
+    # Tab 3 — Screenshots (intentionally empty; testers paste evidence here)
+    shots_ws = wb.create_sheet("Screenshots")
+    shots_ws.column_dimensions["A"].width = 20
+
+    wb.active = 0  # open on Summary
 
     buf = io.BytesIO()
     wb.save(buf)
